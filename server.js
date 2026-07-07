@@ -27,9 +27,36 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', model: 'gpt-4o-mini' });
 });
 
+// Streamt een Responses API-run met de web_search tool naar de client
+async function streamWithWebSearch(messages, res, toolType) {
+  const stream = await openai.responses.create({
+    model: 'gpt-4o-mini',
+    instructions: SYSTEM_PROMPT,
+    input: messages,
+    tools: [{ type: toolType, search_context_size: 'medium' }],
+    stream: true,
+    max_output_tokens: 16000,
+  });
+
+  for await (const event of stream) {
+    if (event.type === 'response.output_item.added' && event.item?.type === 'web_search_call') {
+      res.write(`data: ${JSON.stringify({ search: true })}\n\n`);
+    } else if (event.type === 'response.output_text.delta' && event.delta) {
+      res.write(`data: ${JSON.stringify({ content: event.delta })}\n\n`);
+    } else if (event.type === 'response.output_text.annotation.added' &&
+               event.annotation?.type === 'url_citation') {
+      res.write(`data: ${JSON.stringify({
+        citation: { url: event.annotation.url, title: event.annotation.title || '' }
+      })}\n\n`);
+    } else if (event.type === 'response.failed' || event.type === 'error') {
+      throw new Error(event.response?.error?.message || event.message || 'Response failed');
+    }
+  }
+}
+
 // Chat endpoint with streaming
 app.post('/api/chat', async (req, res) => {
-  const { messages } = req.body;
+  const { messages, webSearch } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: 'messages array required' });
@@ -42,21 +69,34 @@ app.post('/api/chat', async (req, res) => {
   res.flushHeaders();
 
   try {
-    const stream = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        ...messages
-      ],
-      stream: true,
-      max_tokens: 16000,
-      temperature: 1,
-    });
+    if (webSearch) {
+      try {
+        await streamWithWebSearch(messages, res, 'web_search');
+      } catch (error) {
+        // Oudere accounts/modellen kennen alleen de preview-variant van de tool
+        if (/web_search/i.test(error.message) && /not (supported|allowed|found)|invalid/i.test(error.message)) {
+          await streamWithWebSearch(messages, res, 'web_search_preview');
+        } else {
+          throw error;
+        }
+      }
+    } else {
+      const stream = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          ...messages
+        ],
+        stream: true,
+        max_tokens: 16000,
+        temperature: 1,
+      });
 
-    for await (const chunk of stream) {
-      const delta = chunk.choices[0]?.delta?.content || '';
-      if (delta) {
-        res.write(`data: ${JSON.stringify({ content: delta })}\n\n`);
+      for await (const chunk of stream) {
+        const delta = chunk.choices[0]?.delta?.content || '';
+        if (delta) {
+          res.write(`data: ${JSON.stringify({ content: delta })}\n\n`);
+        }
       }
     }
 
